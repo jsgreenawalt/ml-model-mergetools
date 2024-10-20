@@ -184,9 +184,10 @@ The script uses the SafeTensors format for efficient and safe tensor storage and
 
 - Only works with models that share the same architecture (homologous models)
 - Performance may vary depending on the similarity and quality of the variant models
-- Requires significant computational resources for large language models
+- Requires a GPU on the host system
 - The effectiveness of the merge depends on the chosen priority order of variant models
 - The dynamic drop rate calculation may need tuning for optimal results with different model sets
+- Currently no direct Huggingface integration, symlink or hardlink from your huggingface cache if you need to.
 
 ## Contributing
 
@@ -195,3 +196,5 @@ Contributions to Circuit-Merge! are welcome. Please submit issues and pull reque
 ## License
 
 Circuit-Merge is released under the MIT License. See the LICENSE file for details.
+
+All software and materials Copyright 2024 Joseph S. Greenawalt

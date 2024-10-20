@@ -2,7 +2,7 @@
 
 Circuit-Merge! and other tools for working with, validating, and merging Large Language Models
 
-# Circuit-Merge Documentation
+# Circuit-Merge! Documentation
 
 ## Overview
 
@@ -75,7 +75,7 @@ parameters:
 
 ## How It Works
 
-Circuit-Merge implements a temperature-based model merging algorithm with sign-based conflict resolution. The key steps in the process are:
+Circuit-Merge! implements a temperature-based model merging algorithm with sign-based conflict resolution. The key steps in the process are:
 
 1. **Delta Calculation**: Compute the difference (delta) between each variant model and the base model.
 2. **Thresholding**: Apply a threshold to ignore insignificant changes in the delta parameters.
@@ -89,7 +89,7 @@ Circuit-Merge implements a temperature-based model merging algorithm with sign-b
 
 ### Model Priority and Processing Order
 
-Circuit-Merge introduces the concept of model priority to control the influence of each variant model on the final merged result. The priority is determined by the order in which variant models are listed in the YAML configuration file or command-line arguments.
+Circuit-Merge! introduces the concept of model priority to control the influence of each variant model on the final merged result. The priority is determined by the order in which variant models are listed in the YAML configuration file or command-line arguments.
 
 Importantly, the script processes variant models in reverse order of their listing. This means that the last variant model listed in the YAML configuration is processed first and considered the lowest priority model. Conversely, the first variant model listed is processed last and has the highest priority. This processing order ensures that higher priority models have a greater influence on the final merged model.
 
@@ -190,7 +190,7 @@ The script uses the SafeTensors format for efficient and safe tensor storage and
 
 ## Contributing
 
-Contributions to Circuit-Merge are welcome. Please submit issues and pull requests on the project's GitHub repository.
+Contributions to Circuit-Merge! are welcome. Please submit issues and pull requests on the project's GitHub repository.
 
 ## License
 

@@ -40,7 +40,7 @@ pip install torch safetensors tqdm pyyaml
 ### Command Line Interface
 
 ```bash
-python circuit-merge.py [--config CONFIG_FILE] [--temperature TEMP] [--base_droprate RATE] [--meaningful_change_threshold THRESHOLD] [--seed SEED] [--skip_rescaling] BASE_MODEL VARIANT_MODEL1 [VARIANT_MODEL2 ...] OUTPUT_DIR
+python circuit-merge.py [--config CONFIG_FILE] [--temperature TEMP] [--base_droprate RATE] [--meaningful_change_threshold THRESHOLD] [--merge_method METHOD] [--seed SEED] [--skip_rescaling] BASE_MODEL VARIANT_MODEL1 [VARIANT_MODEL2 ...] OUTPUT_DIR
 ```
 
 ### Arguments
@@ -52,6 +52,7 @@ python circuit-merge.py [--config CONFIG_FILE] [--temperature TEMP] [--base_drop
 - `--temperature`: Temperature parameter for interpolating between geometric decay and true average (default: 0.0)
 - `--base_droprate`: Base drop rate for the highest priority model (default: 0.5)
 - `--meaningful_change_threshold`: Threshold for considering weight deltas as meaningful changes (default: 2e-6)
+- `--merge_method`: Merge algorithm to use, `circuit_merge` or `dynamic_ties` (default: `circuit_merge`)
 - `--seed`: Set a fixed seed for reproducibility
 - `--skip_rescaling`: Skip rescaling of weights after pruning
 - `--test`: Run a test function with synthetic data
@@ -179,6 +180,30 @@ The `calculate_p` function determines the drop rate for each variant model, allo
 ### SafeTensors Support
 
 The script uses the SafeTensors format for efficient and safe tensor storage and loading.
+
+## Experimental: `dynamic_ties`
+
+**Status: experimental and unevaluated. Use `circuit_merge` (the default) for
+real work.**
+
+Merge algorithms are selected through a `MERGE_METHODS` registry and the
+`--merge_method` flag. A second method, `dynamic_ties`, is available alongside
+the default.
+
+Where `circuit_merge` resolves conflicting deltas by sign, `dynamic_ties` treats
+each parameter's set of variant deltas as a weighted one-dimensional
+distribution and merges to its **mode** rather than its mean — the point of
+maximum kernel density. It fits a Gaussian KDE with bandwidth from Silverman's
+rule, then runs gradient ascent from several starting points (each input delta,
+plus the weighted mean) to locate the highest peak.
+
+The intuition: if three of five variants agree closely on a change and two are
+outliers, the mean is dragged toward the outliers while the mode sits on the
+consensus. Averaging assumes the delta distribution is unimodal; when fine-tunes
+genuinely disagree, that assumption is wrong.
+
+Whether this actually produces better merges has not been measured. It is
+published because the idea is worth examining, not because it is recommended.
 
 ## Limitations and Considerations
 

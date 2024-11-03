@@ -282,7 +282,7 @@ Key Behaviors:
 - Zero deltas (below threshold or pruned by MAGPRUNE) are ignored and don't affect weighting
 - MAGPRUNE is applied to reduce noise and sparsify deltas before merging
 '''
-def process_and_merge_tensor(base_file: str, variant_files: List[str], tensor_name: str, temperature: float, base_droprate: float, meaningful_change_threshold: float, skip_rescaling: bool = False) -> torch.Tensor:
+def process_and_merge_tensor_circuit_merge(base_file: str, variant_files: List[str], tensor_name: str, temperature: float, base_droprate: float, meaningful_change_threshold: float, skip_rescaling: bool = False) -> torch.Tensor:
     global device
     print(f"Processing tensor: {tensor_name}")
     gc.collect()
@@ -408,6 +408,174 @@ def process_and_merge_tensor(base_file: str, variant_files: List[str], tensor_na
 
     return merged_tensor
 
+
+def process_and_merge_tensor_dynamic_ties(base_file: str, variant_files: List[str], tensor_name: str, temperature: float, base_droprate: float, meaningful_change_threshold: float, skip_rescaling: bool = False) -> torch.Tensor:
+    print(f"Processing tensor: {tensor_name} using Dynamic TIES with Density-Based Merging")
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        # Load base tensor and setup
+        with safe_open(base_file, framework="pt", device="cpu") as base_f:
+            base_tensor = base_f.get_tensor(tensor_name).to(device)
+
+        shape = base_tensor.shape
+        dtype = base_tensor.dtype
+
+        # Calculate chunk size based on available memory
+        free_memory = get_free_gpu_memory()
+        bytes_per_element = torch.tensor([], dtype=dtype).element_size()
+        try:
+            row_size_bytes = shape[1] * bytes_per_element
+        except:
+            row_size_bytes = bytes_per_element
+        memory_usage_factor = 12.0
+        rows_per_chunk = max(1, int(free_memory / (row_size_bytes * len(variant_files) * memory_usage_factor)))
+
+        # Helper function to find the maximum density point
+        def find_max_density_point(points, weights):
+            if len(points) == 1:
+                return points[0]
+            
+            # Calculate bandwidth using Silverman's rule
+            n = len(points)
+            std = torch.std(points)
+            iqr = torch.quantile(points, torch.tensor(0.75, device=device)) - torch.quantile(points, torch.tensor(0.25, device=device))
+            bandwidth = 0.9 * torch.min(std, iqr/1.34) * n**(-0.2)
+            bandwidth = torch.max(bandwidth, torch.tensor(1e-6, device=device))
+            bandwidth_sq = bandwidth * bandwidth
+
+            # Define weighted kernel density at a point
+            def density(x):
+                diff_sq = (x - points).pow(2) / (2 * bandwidth_sq)
+                kernel_values = torch.exp(-diff_sq) / (bandwidth * (2 * np.pi)**0.5)
+                return (kernel_values * weights).sum()
+
+            # Define gradient of the density
+            def density_gradient(x):
+                diff = (x - points) / bandwidth
+                kernel_values = torch.exp(-diff.pow(2) / 2) / (bandwidth * (2 * np.pi)**0.5)
+                return (diff * kernel_values * weights).sum()
+
+            # Get weighted average as a reference point and bounds
+            weighted_avg = (points * weights).sum() / weights.sum()
+            min_val = points.min()
+            max_val = points.max()
+            # Extend bounds slightly to allow for maxima near endpoints
+            range_width = max_val - min_val
+            min_val = min_val - 0.1 * range_width
+            max_val = max_val + 0.1 * range_width
+
+            # Start points: weighted average and input points
+            start_points = torch.cat([points, weighted_avg.unsqueeze(0)])
+            
+            # Gradient ascent from each starting point
+            max_iters = 30
+            tolerance = 1e-6
+            best_x = None
+            best_density = float('-inf')
+
+            for start_point in start_points:
+                x = start_point.clone()
+                prev_density = density(x)
+                
+                for _ in range(max_iters):
+                    grad = density_gradient(x)
+                    # Adaptive learning rate based on gradient magnitude
+                    lr = bandwidth_sq / (1 + torch.abs(grad))
+                    
+                    # Update with gradient ascent
+                    x_new = x + lr * grad
+                    # Clamp to valid range
+                    x_new = torch.clamp(x_new, min_val, max_val)
+                    
+                    current_density = density(x_new)
+                    if torch.abs(current_density - prev_density) < tolerance:
+                        break
+                        
+                    x = x_new
+                    prev_density = current_density
+
+                # Update best solution if this is better
+                final_density = density(x)
+                if final_density > best_density:
+                    best_density = final_density
+                    best_x = x
+
+            return best_x
+
+        # Calculate model weights based on temperature
+        def get_model_weights(num_models):
+            if num_models == 1:
+                return torch.tensor([1.0], device=device)
+            
+            #geometric_weights = torch.tensor([0.5 ** i for i in range(num_models)], device=device)
+            geometric_weights = torch.tensor([0.5 ** i for i in reversed(range(num_models))], device=device)
+            geometric_weights /= geometric_weights.sum()
+            
+            if temperature == 0.0:
+                return geometric_weights
+            elif temperature == 1.0:
+                return torch.ones(num_models, device=device) / num_models
+            else:
+                equal_weights = torch.ones(num_models, device=device) / num_models
+                return (1 - temperature) * geometric_weights + temperature * equal_weights
+
+        # Initialize output tensor
+        final_deltas = torch.zeros_like(base_tensor, dtype=torch.float32, device=device)
+        
+        # Process tensor in chunks
+        for start_row in range(0, shape[0], rows_per_chunk):
+            end_row = min(start_row + rows_per_chunk, shape[0])
+            chunk_deltas = []
+            
+            # Collect deltas from all variants
+            for variant_file in variant_files:
+                with safe_open(variant_file, framework="pt", device="cpu") as variant_f:
+                    variant_chunk = variant_f.get_tensor(tensor_name)[start_row:end_row].to(device)
+                    delta = variant_chunk - base_tensor[start_row:end_row]
+                    significant_mask = torch.abs(delta) >= meaningful_change_threshold
+                    delta[~significant_mask] = 0
+                    chunk_deltas.append(delta)
+                    
+                    del variant_chunk
+                    gc.collect()
+
+            # Process each element using density estimation
+            stacked_deltas = torch.stack(chunk_deltas, dim=0)
+            model_weights = get_model_weights(len(chunk_deltas))
+            
+            # Process element-wise to save memory
+            for i in range(end_row - start_row):
+                for j in range(stacked_deltas.shape[-1]):
+                    deltas = stacked_deltas[:, i, j]
+                    non_zero_mask = deltas != 0
+                    non_zero_deltas = deltas[non_zero_mask]
+                    
+                    if len(non_zero_deltas) > 0:
+                        # Find the point of maximum density
+                        max_density_point = find_max_density_point(
+                            non_zero_deltas,
+                            model_weights[non_zero_mask]  # Only use weights for non-zero deltas
+                        )
+                        final_deltas[start_row + i, j] = max_density_point
+
+            del stacked_deltas, chunk_deltas
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        # Create merged tensor
+        merged_tensor = base_tensor + final_deltas
+
+        del base_tensor, final_deltas
+        gc.collect()
+        stream.synchronize()
+        torch.cuda.empty_cache()
+
+    return merged_tensor
+
+
 def save_chunked_safetensors(state_dict: Dict[str, torch.Tensor], output_dir: str):
     os.makedirs(output_dir, exist_ok=True)
     current_chunk = {}
@@ -472,13 +640,20 @@ def copy_config_files(base_dir: str, output_dir: str):
         else:
             print(f"Warning: {file} not found in base model directory")
 
-def merge_models(base_dir: str, variant_dirs: List[str], output_dir: str, temperature: float, base_droprate: float, meaningful_change_threshold: float, skip_rescaling: bool = False):
+
+def merge_models(base_dir: str, variant_dirs: List[str], output_dir: str, temperature: float, base_droprate: float, meaningful_change_threshold: float, merge_method: str = 'circuit_merge', skip_rescaling: bool = False):
     global SEED
     print(f"Base directory: {base_dir}")
     for i, variant_dir in enumerate(variant_dirs, 1):
         print(f"Variant {i} directory: {variant_dir}")
     print(f"Output directory: {output_dir}")
     print(f"Temperature: {temperature}")
+    print(f"Merge method: {merge_method}")
+
+    if merge_method not in MERGE_METHODS:
+        raise ValueError(f"Unsupported merge method: {merge_method}. Available methods: {list(MERGE_METHODS.keys())}")
+
+    merge_function = MERGE_METHODS[merge_method]
 
     print("Loading tensor metadata...")
     base_tensors = load_tensors_from_directory(base_dir)
@@ -490,7 +665,7 @@ def merge_models(base_dir: str, variant_dirs: List[str], output_dir: str, temper
 
     print(f"Total unique tensors: {len(all_tensor_names)}")
 
-    print("Merging tensors:")
+    print(f"Merging tensors using {merge_method}:")
     merged_state_dict = {}
     all_tensor_names = list(all_tensor_names)
     all_tensor_names.sort()
@@ -509,7 +684,7 @@ def merge_models(base_dir: str, variant_dirs: List[str], output_dir: str, temper
 
         variant_files = [variant[tensor_name] for variant in variant_tensors if tensor_name in variant]
 
-        merged_tensor = process_and_merge_tensor(base_file, variant_files, tensor_name, temperature, base_droprate, meaningful_change_threshold, skip_rescaling=skip_rescaling)
+        merged_tensor = merge_function(base_file, variant_files, tensor_name, temperature, base_droprate, meaningful_change_threshold, skip_rescaling=skip_rescaling)
         merged_state_dict[tensor_name] = merged_tensor.cpu()  # Move the tensor back to CPU
         del merged_tensor
         gc.collect()
@@ -627,16 +802,13 @@ def print_models(base, variant1, variant2, merged):
             print()
 
 
-def run_test(temperature, seed):
-    #torch.use_deterministic_algorithms(True) # <- kills performance, not guaranteed, and seemingly not needed on my machine
+def run_test(temperature, seed, merge_method='circuit_merge'):
     set_seed(seed)
 
     # Create synthetic data
     base_model = create_synthetic_data()
     variant1 = perturb_model(base_model)
     variant2 = perturb_model(base_model)
-    #variant1 = base_model
-    #variant2 = variant1
 
     # Save models to temporary directories
     temp_dir = "./temp_test_models"
@@ -651,7 +823,10 @@ def run_test(temperature, seed):
         os.path.join(temp_dir, "base"),
         [os.path.join(temp_dir, "variant1"), os.path.join(temp_dir, "variant2")],
         output_dir,
-        temperature,
+        temperature=temperature,
+        base_droprate=0.5,
+        meaningful_change_threshold=2e-6,
+        merge_method=merge_method,
         skip_rescaling=True
     )
 
@@ -665,6 +840,13 @@ def run_test(temperature, seed):
     # Clean up temporary directories
     shutil.rmtree(temp_dir)
 
+# Mapping of merge methods to their implementations
+MERGE_METHODS = {
+    'circuit_merge': process_and_merge_tensor_circuit_merge,
+    'dynamic_ties': process_and_merge_tensor_dynamic_ties,
+}
+
+
 def main():
     global SEED
     parser = argparse.ArgumentParser(description="Merge a base SafeTensors model with multiple variant models.")
@@ -675,13 +857,14 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0, help="Temperature parameter interpolate between geometric decay and true average for drop rate and weight merge (default: 0.0)")
     parser.add_argument("--base_droprate", type=float, default=0.5, help="Base drop-rate set initial p for highest priority model (default: 0.5)")
     parser.add_argument("--meaningful_change_threshold", type=float, default=2e-6, help="Consider any weight delta below this value to be zero, no change (default: 2e-6)")
+    parser.add_argument("--merge_method", type=str, default="circuit_merge", choices=list(MERGE_METHODS.keys()), help="Merge method to use (default: circuit_merge)")
     parser.add_argument("--seed", type=int, default=0, help="Set a fixed seed for torch and python rng")
     parser.add_argument("--test", action="store_true", help="Run test function")
     parser.add_argument("--skip_rescaling", action="store_true", help="Skip rescaling of weights after pruning")
     args = parser.parse_args()
     print(args)
     if args.test:
-        run_test(args.temperature, args.seed)
+        run_test(args.temperature, args.seed, args.merge_method)  # Pass merge_method to run_test
     else:
         # Existing code for merging models
         if args.config:
@@ -692,6 +875,7 @@ def main():
             if 'parameters' in config:
                 setattr(args, "base_droprate", 0.5) # default 0.5
                 setattr(args, "meaningful_change_threshold", 2e-6) # default 2e-6
+                setattr(args, "merge_method", "circuit_merge")
                 for key, value in config['parameters'].items():
                     setattr(args, key, value)
         else:
@@ -702,7 +886,16 @@ def main():
         SEED = args.seed
         set_seed(args.seed)
 
-        merge_models(args.base_model, args.variant_models, args.output_dir, args.temperature, args.base_droprate, args.meaningful_change_threshold, skip_rescaling=args.skip_rescaling)
+        merge_models(
+            args.base_model,
+            args.variant_models,
+            args.output_dir,
+            args.temperature,
+            args.base_droprate,
+            args.meaningful_change_threshold,
+            merge_method=args.merge_method,
+            skip_rescaling=args.skip_rescaling
+        )
 
 if __name__ == "__main__":
     main()
